@@ -1,4 +1,5 @@
 # Copilot Monitor
+<img src ="sample.png"/>
 
 App de barra de menus para acompanhar os créditos de uso do Copilot pela API do GitHub. Os dados ficam em `~/Library/Application Support/CopilotMonitor/usage.sqlite`; nenhum log local do Copilot é lido.
 
