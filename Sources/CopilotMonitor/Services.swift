@@ -20,6 +20,22 @@ enum MonitorError: Error, LocalizedError {
     }
 }
 
+/// Localização do banco, compartilhada pelo app (`AppDelegate`) e pelo modo CLI.
+enum MonitorDatabase {
+    /// `COPILOT_MONITOR_DEMO=1`: dados sintéticos num banco separado, sem acesso à rede.
+    static var isDemo: Bool { ProcessInfo.processInfo.environment["COPILOT_MONITOR_DEMO"] == "1" }
+
+    /// `~/Library/Application Support/CopilotMonitor/usage.sqlite` (`usage-demo.sqlite` no demo).
+    static func url(demo: Bool) throws -> URL {
+        try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true
+        )
+        .appendingPathComponent("CopilotMonitor", isDirectory: true)
+        .appendingPathComponent(demo ? "usage-demo.sqlite" : "usage.sqlite")
+    }
+}
+
 enum KeychainTokenStore {
     private static let service = "local.copilotmonitor"
     private static let account = "github-token"

@@ -17,13 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func start() {
         do {
-            let demo = ProcessInfo.processInfo.environment["COPILOT_MONITOR_DEMO"] == "1"
-            let support = try FileManager.default.url(
-                for: .applicationSupportDirectory, in: .userDomainMask,
-                appropriateFor: nil, create: true
-            ).appendingPathComponent("CopilotMonitor", isDirectory: true)
-            let databaseURL = support.appendingPathComponent(demo ? "usage-demo.sqlite" : "usage.sqlite")
-            let store = try SQLiteUsageStore(url: databaseURL)
+            let demo = MonitorDatabase.isDemo
+            let store = try SQLiteUsageStore(url: MonitorDatabase.url(demo: demo))
             let model = try MonitorModel(store: store, demo: demo)
             self.model = model
             preferencesObserver = NotificationCenter.default.addObserver(
@@ -74,8 +69,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let model, let button = statusItem?.button else { return }
         button.title = model.statusTitle
         button.contentTintColor = model.statusColor
-        if model.isDemo { button.toolTip = "Copilot Monitor · modo demo" }
-        else { button.toolTip = model.offlineDescription() ?? "Copilot Monitor" }
+        var toolTip = model.isDemo ? "Copilot Monitor · modo demo" : (model.offlineDescription() ?? "Copilot Monitor")
+        if let session = model.metrics?.activeSession {
+            toolTip += "\nSessão ativa · \(MonitorModel.number(session.credits)) cr"
+        }
+        button.toolTip = toolTip
     }
 
     deinit {

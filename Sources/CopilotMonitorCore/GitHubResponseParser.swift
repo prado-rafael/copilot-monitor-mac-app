@@ -53,7 +53,9 @@ public enum GitHubResponseParser {
         (value as? NSNumber)?.boolValue ?? false
     }
 
-    private static func parseDate(_ string: String) -> Date? {
+    /// Interpreta datas ISO 8601 (com ou sem fração de segundo) e `yyyy-MM-dd` em UTC,
+    /// os formatos de `assigned_date`, `quota_reset_date(_utc)` e das chaves de ciclo.
+    public static func parseDate(_ string: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let date = fractional.date(from: string) { return date }

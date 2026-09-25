@@ -27,6 +27,8 @@ public final class SQLiteUsageStore {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "SQLite não abriu o arquivo."
             throw SQLiteUsageStoreError.open(message)
         }
+        // O CLI lê enquanto o app grava: espera até 2 s pelo lock em vez de falhar com SQLITE_BUSY.
+        sqlite3_busy_timeout(database, 2000)
         try execute("""
             CREATE TABLE IF NOT EXISTS samples(
                 ts INTEGER NOT NULL,
@@ -37,6 +39,12 @@ public final class SQLiteUsageStore {
             );
             CREATE INDEX IF NOT EXISTS samples_ts_idx ON samples(ts);
             CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS cycles(
+                reset_date TEXT PRIMARY KEY,
+                entitlement REAL NOT NULL,
+                used REAL NOT NULL,
+                closed_ts INTEGER NOT NULL
+            );
             """)
     }
 
@@ -51,6 +59,18 @@ public final class SQLiteUsageStore {
         sqlite3_bind_double(statement, 4, sample.overage)
         bind(sample.resetDate, to: statement, at: 5)
         try stepDone(statement)
+    }
+
+    /// Grava várias amostras numa única transação (o demo semeia ~13 mil de uma vez).
+    public func append(contentsOf samples: [UsageSample]) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for sample in samples { try append(sample) }
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
     }
 
     public func samples(since timestamp: Int64 = 0) throws -> [UsageSample] {
@@ -96,6 +116,55 @@ public final class SQLiteUsageStore {
 
     public func removeAllSamples() throws {
         try execute("DELETE FROM samples")
+    }
+
+    /// Grava (ou substitui) o ciclo fechado com chave `summary.resetDate`.
+    public func upsertCycle(_ summary: CycleSummary, closedAt: Date) throws {
+        let statement = try prepare("""
+            INSERT INTO cycles(reset_date, entitlement, used, closed_ts) VALUES(?, ?, ?, ?)
+            ON CONFLICT(reset_date) DO UPDATE SET
+                entitlement = excluded.entitlement, used = excluded.used, closed_ts = excluded.closed_ts
+            """)
+        defer { sqlite3_finalize(statement) }
+        bind(summary.resetDate, to: statement, at: 1)
+        sqlite3_bind_double(statement, 2, summary.entitlement)
+        sqlite3_bind_double(statement, 3, summary.used)
+        sqlite3_bind_int64(statement, 4, Int64(closedAt.timeIntervalSince1970))
+        try stepDone(statement)
+    }
+
+    /// Ciclos fechados, ordenados por `reset_date`.
+    public func cycles() throws -> [CycleSummary] {
+        let statement = try prepare("SELECT reset_date, entitlement, used FROM cycles ORDER BY reset_date")
+        defer { sqlite3_finalize(statement) }
+        var result: [CycleSummary] = []
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { break }
+            guard status == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+                throw currentError()
+            }
+            result.append(CycleSummary(
+                resetDate: String(cString: text),
+                entitlement: sqlite3_column_double(statement, 1),
+                used: sqlite3_column_double(statement, 2)
+            ))
+        }
+        return result
+    }
+
+    /// Deriva ciclos fechados de `samples`: a última leitura de cada `reset_date` diferente do atual.
+    /// Não sobrescreve ciclos já gravados.
+    public func backfillCycles(excluding currentResetDate: String) throws {
+        // Com um único MAX(), o SQLite tira as colunas simples (entitlement, used) da linha do máximo.
+        let statement = try prepare("""
+            INSERT OR IGNORE INTO cycles(reset_date, entitlement, used, closed_ts)
+            SELECT reset_date, entitlement, used, MAX(ts) FROM samples
+            WHERE reset_date <> ? GROUP BY reset_date
+            """)
+        defer { sqlite3_finalize(statement) }
+        bind(currentResetDate, to: statement, at: 1)
+        try stepDone(statement)
     }
 
     public func setMetadata(_ value: Data?, forKey key: String) throws {

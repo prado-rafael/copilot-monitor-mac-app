@@ -57,6 +57,48 @@ public struct UsageSample: Sendable, Equatable {
     public var date: Date { Date(timeIntervalSince1970: TimeInterval(timestamp)) }
 }
 
+/// Ciclo fechado, persistido na tabela `cycles`.
+public struct CycleSummary: Sendable, Equatable, Codable {
+    /// Mesma chave usada em `UsageSample.resetDate`.
+    public let resetDate: String
+    public let entitlement: Double
+    public let used: Double
+    public var overage: Double { max(0, used - entitlement) }
+
+    public init(resetDate: String, entitlement: Double, used: Double) {
+        self.resetDate = resetDate
+        self.entitlement = entitlement
+        self.used = used
+    }
+}
+
+/// Preferências espelhadas em `metadata` (chave `settings`) para leitores fora do app.
+public struct MonitorSettings: Codable, Sendable, Equatable {
+    public static let metadataKey = "settings"
+    /// Padrões do app com UserDefaults vazio; o CLI usa quando o banco ainda não tem `settings`.
+    public static let defaults = MonitorSettings(
+        dailyBudgetMode: "auto", dailyBudgetCredits: 0, sessionGapMinutes: 10, peakThreshold: 40
+    )
+
+    /// `"off" | "auto" | "manual"`.
+    public var dailyBudgetMode: String
+    /// Último valor manual, preservado mesmo quando o modo não é manual.
+    public var dailyBudgetCredits: Double
+    public var sessionGapMinutes: Double
+    public var peakThreshold: Double
+
+    public init(dailyBudgetMode: String, dailyBudgetCredits: Double, sessionGapMinutes: Double, peakThreshold: Double) {
+        self.dailyBudgetMode = dailyBudgetMode
+        self.dailyBudgetCredits = dailyBudgetCredits
+        self.sessionGapMinutes = sessionGapMinutes
+        self.peakThreshold = peakThreshold
+    }
+
+    public var dailyBudget: DailyBudgetSetting {
+        DailyBudgetSetting(mode: dailyBudgetMode, credits: dailyBudgetCredits)
+    }
+}
+
 public enum UsageParseError: Error, LocalizedError {
     case invalidJSON
     case missingField(String)

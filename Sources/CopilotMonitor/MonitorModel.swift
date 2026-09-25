@@ -5,21 +5,55 @@ import ServiceManagement
 import UserNotifications
 
 enum StatusFormat: String, CaseIterable, Identifiable {
-    case todayAndPercent, dollarsToday, cyclePercent
+    case todayAndPercent, dollarsToday, cyclePercent, todayVsBudget
     var id: String { rawValue }
     var title: String {
         switch self {
         case .todayAndPercent: return "Hoje · % do ciclo"
         case .dollarsToday: return "US$ hoje"
         case .cyclePercent: return "% do ciclo"
+        case .todayVsBudget: return "Hoje / orçamento"
         }
     }
 }
 
+/// Modos do orçamento diário; `rawValue` é o valor gravado em `dailyBudgetMode`.
+enum DailyBudgetMode: String, CaseIterable, Identifiable {
+    case off, auto, manual
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .off: return "Desligado"
+        case .auto: return "Automático (dias úteis até o reset)"
+        case .manual: return "Manual"
+        }
+    }
+}
+
+private struct MetricsCacheKey: Hashable {
+    let period: UsagePeriod
+    let periodOffset: Int
+    let samplesVersion: Int
+    let sessionGapMinutes: Double
+    let dailyBudget: DailyBudgetSetting
+    let minuteBucket: Int
+}
+
 @MainActor
 final class MonitorModel: ObservableObject {
-    @Published private(set) var samples: [UsageSample] = []
-    @Published private(set) var snapshot: UsageSnapshot?
+    @Published private(set) var samples: [UsageSample] = [] {
+        didSet {
+            samplesVersion &+= 1
+            metricsCache.removeAll()
+        }
+    }
+    @Published private(set) var snapshot: UsageSnapshot? {
+        didSet { metricsCache.removeAll() }
+    }
+    /// Ciclos fechados (tabela `cycles`), ordenados por `resetDate`.
+    @Published private(set) var cycles: [CycleSummary] = [] {
+        didSet { metricsCache.removeAll() }
+    }
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var errorMessage: String?
     @Published private(set) var notificationError: String?
@@ -30,8 +64,28 @@ final class MonitorModel: ObservableObject {
     @Published var interval: TimeInterval
     @Published var statusFormat: StatusFormat
     @Published var notificationsEnabled: Bool
-    @Published var peakThreshold: Double
-    @Published var sessionGapMinutes: Double
+    @Published var peakThreshold: Double {
+        didSet { persistSettings() }
+    }
+    @Published var sessionGapMinutes: Double {
+        didSet {
+            metricsCache.removeAll()
+            persistSettings()
+        }
+    }
+    @Published var dailyBudgetSetting: DailyBudgetSetting {
+        didSet {
+            guard dailyBudgetSetting != oldValue else { return }
+            metricsCache.removeAll()
+            if case let .manual(credits) = dailyBudgetSetting { dailyBudgetCredits = credits }
+            let defaults = UserDefaults.standard
+            defaults.set(dailyBudgetSetting.mode, forKey: "dailyBudgetMode")
+            defaults.set(dailyBudgetCredits, forKey: "dailyBudgetCredits")
+            persistSettings()
+        }
+    }
+    /// Último valor manual; preservado ao alternar para desligado/automático.
+    private(set) var dailyBudgetCredits: Double
 
     let isDemo: Bool
     private let store: SQLiteUsageStore
@@ -43,6 +97,10 @@ final class MonitorModel: ObservableObject {
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var refreshInProgress = false
+    private var samplesVersion = 0
+    private var metricsCache: [MetricsCacheKey: UsageMetrics] = [:]
+    private static let metricsCacheLimit = 8
+    private var lastPersistedSettings: Data?
 
     init(store: SQLiteUsageStore, demo: Bool) throws {
         self.store = store
@@ -52,29 +110,25 @@ final class MonitorModel: ObservableObject {
         interval = configuredInterval > 0 ? configuredInterval : 60
         statusFormat = StatusFormat(rawValue: defaults.string(forKey: "statusFormat") ?? "") ?? .todayAndPercent
         notificationsEnabled = defaults.object(forKey: "notificationsEnabled") as? Bool ?? true
-        peakThreshold = defaults.object(forKey: "peakThreshold") as? Double ?? 40
-        sessionGapMinutes = defaults.object(forKey: "sessionGapMinutes") as? Double ?? 10
+        let fallback = MonitorSettings.defaults
+        peakThreshold = defaults.object(forKey: "peakThreshold") as? Double ?? fallback.peakThreshold
+        sessionGapMinutes = defaults.object(forKey: "sessionGapMinutes") as? Double ?? fallback.sessionGapMinutes
+        let budgetCredits = defaults.object(forKey: "dailyBudgetCredits") as? Double ?? fallback.dailyBudgetCredits
+        dailyBudgetCredits = budgetCredits
+        dailyBudgetSetting = DailyBudgetSetting(
+            mode: defaults.string(forKey: "dailyBudgetMode"), credits: budgetCredits
+        )
 
+        // Histórico das 13 semanas do calendário de atividade.
+        let historyStart = Int64(Date().addingTimeInterval(-Double(MetricsEngine.historyDays) * 86400).timeIntervalSince1970)
         if demo {
-            let seeded = DemoData.make()
-            let existing = try store.samples()
-            if existing.last.map({ Date().timeIntervalSince($0.date) > 1800 }) ?? true {
-                try store.removeAllSamples()
-                for sample in seeded.samples { try store.append(sample) }
-            }
-            samples = try store.samples(since: Int64(Date().addingTimeInterval(-60 * 86400).timeIntervalSince1970))
-            if let last = samples.last {
-                snapshot = UsageSnapshot(
-                    login: seeded.snapshot.login, plan: seeded.snapshot.plan,
-                    assignedDate: seeded.snapshot.assignedDate, resetDate: seeded.snapshot.resetDate,
-                    resetDateKey: seeded.snapshot.resetDateKey, entitlement: last.entitlement,
-                    quotaRemaining: last.entitlement - last.used, used: last.used, overage: last.overage,
-                    timestamp: last.date, rawJSON: seeded.snapshot.rawJSON
-                )
-                lastUpdated = last.date
-            }
+            // Mesma semeadura do CLI: regrava o histórico sintético se o banco estiver vazio ou velho.
+            snapshot = try DemoData.seed(store)
+            cycles = try store.cycles()
+            samples = try store.samples(since: historyStart)
+            lastUpdated = samples.last?.date
         } else {
-            samples = try store.samples(since: Int64(Date().addingTimeInterval(-60 * 86400).timeIntervalSince1970))
+            samples = try store.samples(since: historyStart)
             if let raw = try store.metadata(forKey: "lastResponse") {
                 do {
                     snapshot = try GitHubResponseParser.parse(raw)
@@ -86,7 +140,13 @@ final class MonitorModel: ObservableObject {
             if let data = try store.metadata(forKey: "etag") {
                 etag = String(data: data, encoding: .utf8)
             }
+            // Ciclos fechados enquanto o app não gravava a tabela `cycles` saem das amostras.
+            if let currentKey = snapshot?.resetDateKey ?? samples.last?.resetDate {
+                try store.backfillCycles(excluding: currentKey)
+            }
+            cycles = try store.cycles()
         }
+        persistSettings()
     }
 
     deinit {
@@ -95,14 +155,7 @@ final class MonitorModel: ObservableObject {
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
     }
 
-    var metrics: UsageMetrics? {
-        guard let snapshot else { return nil }
-        return MetricsEngine.analyze(
-            samples: samples, assignedDate: snapshot.assignedDate, resetDate: snapshot.resetDate,
-            entitlement: snapshot.entitlement, period: selectedPeriod, periodOffset: periodOffset,
-            sessionGap: sessionGapMinutes * 60
-        )
-    }
+    var metrics: UsageMetrics? { cachedMetrics(period: selectedPeriod, offset: periodOffset) }
 
     var currentUsed: Double { snapshot?.used ?? 0 }
     var currentEntitlement: Double { snapshot?.entitlement ?? 0 }
@@ -113,39 +166,63 @@ final class MonitorModel: ObservableObject {
 
     var statusTitle: String {
         guard snapshot != nil else { return "—" }
+        let today = metrics(for: .today)
+        let todayAndPercent = "\(Self.number(today?.periodTotal ?? 0)) · \(Self.number(cyclePercent))%"
         switch statusFormat {
         case .todayAndPercent:
-            return "\(Self.number(metrics(for: .today)?.periodTotal ?? 0)) · \(Self.number(cyclePercent))%"
+            return todayAndPercent
         case .dollarsToday:
-            return "\(Self.dollars(metrics(for: .today)?.periodTotal ?? 0)) hoje"
+            return "\(Self.dollars(today?.periodTotal ?? 0)) hoje"
         case .cyclePercent:
             return "\(Self.number(cyclePercent))% do ciclo"
+        case .todayVsBudget:
+            guard let budget = today?.dailyBudget else { return todayAndPercent }
+            return "\(Self.number(budget.spent)) / \(Self.number(budget.limit))"
         }
     }
 
     var statusColor: NSColor {
         guard let metrics else { return .secondaryLabelColor }
         if currentEntitlement > 0 && currentUsed >= currentEntitlement { return .systemRed }
-        if (metrics.projectedAtReset ?? 0) > currentEntitlement || peakIsActive {
+        // O fallback do ciclo anterior não acende o laranja no primeiro dia de um ciclo novo.
+        let projectedOver = metrics.projectionSource == .linear && (metrics.projectedAtReset ?? 0) > currentEntitlement
+        if projectedOver || peakIsActive || metrics.dailyBudget?.state == .over {
             return .systemOrange
         }
         return .labelColor
     }
 
+    var dailyBudgetMode: DailyBudgetMode { DailyBudgetMode(rawValue: dailyBudgetSetting.mode) ?? .auto }
+
     var peakIsActive: Bool {
+        guard let deltas = metrics?.deltas else { return false }
         let cutoff = Date().addingTimeInterval(-600)
-        return MetricsEngine.deltas(samples: samples)
+        return deltas
             .filter { $0.sample.date > cutoff && !$0.duringAbsence }
             .reduce(0) { $0 + $1.amount } >= peakThreshold
     }
 
-    func metrics(for period: UsagePeriod) -> UsageMetrics? {
+    func metrics(for period: UsagePeriod) -> UsageMetrics? { cachedMetrics(period: period, offset: 0) }
+
+    /// `analyze` memoizado por período, offset, versão das amostras, intervalo de sessão, orçamento e minuto corrente.
+    private func cachedMetrics(period: UsagePeriod, offset: Int) -> UsageMetrics? {
         guard let snapshot else { return nil }
-        return MetricsEngine.analyze(
-            samples: samples, assignedDate: snapshot.assignedDate, resetDate: snapshot.resetDate,
-            entitlement: snapshot.entitlement, period: period, periodOffset: 0,
-            sessionGap: sessionGapMinutes * 60
+        let now = Date()
+        let key = MetricsCacheKey(
+            period: period, periodOffset: offset, samplesVersion: samplesVersion,
+            sessionGapMinutes: sessionGapMinutes, dailyBudget: dailyBudgetSetting,
+            minuteBucket: Int(now.timeIntervalSince1970 / 60)
         )
+        if let cached = metricsCache[key] { return cached }
+        let computed = MetricsEngine.analyze(
+            samples: samples, now: now, assignedDate: snapshot.assignedDate, resetDate: snapshot.resetDate,
+            entitlement: snapshot.entitlement, period: period, periodOffset: offset,
+            sessionGap: sessionGapMinutes * 60, dailyBudget: dailyBudgetSetting,
+            previousCycles: cycles
+        )
+        if metricsCache.count >= Self.metricsCacheLimit { metricsCache.removeAll() }
+        metricsCache[key] = computed
+        return computed
     }
 
     func start() {
@@ -220,17 +297,32 @@ final class MonitorModel: ObservableObject {
             if case .unchanged = result {
                 try store.setMetadata(Data(newSnapshot.rawJSON), forKey: "lastResponse")
             }
+            if let previous = snapshot {
+                if previous.resetDateKey != newSnapshot.resetDateKey { recordClosedCycle(previous) }
+                evaluateSnapshotChange(from: previous, to: newSnapshot)
+            }
             self.snapshot = newSnapshot
             lastUpdated = Date()
             errorMessage = nil
             failures = 0
             samples.append(sample)
-            samples = Array(samples.suffix(100_000))
+            // 91 dias a 60 s ≈ 131 mil leituras: o calendário de 13 semanas cabe inteiro.
+            samples = Array(samples.suffix(150_000))
             evaluateNotifications()
         } catch {
             failures = min(failures + 1, 4)
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Grava o ciclo que acabou de fechar e recarrega `cycles`. Falha aqui não interrompe a coleta:
+    /// o ciclo volta pelo `backfillCycles` na próxima inicialização.
+    private func recordClosedCycle(_ previous: UsageSnapshot) {
+        let summary = CycleSummary(
+            resetDate: previous.resetDateKey, entitlement: previous.entitlement, used: previous.used
+        )
+        try? store.upsertCycle(summary, closedAt: lastUpdated ?? Date())
+        if let stored = try? store.cycles() { cycles = stored }
     }
 
     func selectPeriod(_ period: UsagePeriod) {
@@ -249,6 +341,34 @@ final class MonitorModel: ObservableObject {
     func setStatusFormat(_ format: StatusFormat) {
         statusFormat = format
         UserDefaults.standard.set(format.rawValue, forKey: "statusFormat")
+    }
+
+    func setDailyBudgetMode(_ mode: DailyBudgetMode) {
+        if mode == .manual && dailyBudgetCredits <= 0 {
+            // Sem valor manual anterior: parte do automático de hoje para não nascer estourado.
+            let today = metrics(for: .today)
+            dailyBudgetCredits = (today?.dailyBudget?.limit ?? today?.weekdayBudget).map { max(1, $0.rounded()) } ?? 100
+        }
+        dailyBudgetSetting = DailyBudgetSetting(mode: mode.rawValue, credits: dailyBudgetCredits)
+    }
+
+    func setDailyBudgetCredits(_ credits: Double) {
+        dailyBudgetSetting = .manual(max(0, credits))
+    }
+
+    /// Espelha as preferências em `metadata` (chave `settings`) para leitores fora do app.
+    /// UserDefaults continua sendo a fonte do app; falha aqui não interrompe nada.
+    private func persistSettings() {
+        let settings = MonitorSettings(
+            dailyBudgetMode: dailyBudgetSetting.mode, dailyBudgetCredits: dailyBudgetCredits,
+            sessionGapMinutes: sessionGapMinutes, peakThreshold: peakThreshold
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(settings), data != lastPersistedSettings else { return }
+        if (try? store.setMetadata(data, forKey: MonitorSettings.metadataKey)) != nil {
+            lastPersistedSettings = data
+        }
     }
 
     func requestNotificationPermission() {
@@ -309,14 +429,27 @@ final class MonitorModel: ObservableObject {
             }
             defaults.set(Array(sent), forKey: cycleKey)
         }
-        if let projected = metrics?.projectedAtReset, projected > snapshot.entitlement {
+        // Só a projeção linear: o fallback do ciclo anterior não avisa no primeiro dia de um ciclo novo.
+        if let metrics, metrics.projectionSource == .linear,
+           let projected = metrics.projectedAtReset, projected > snapshot.entitlement {
             let key = "projection-notified-\(Self.dayKey(Date()))"
             if !defaults.bool(forKey: key) {
                 notify(title: "Projeção acima da quota", body: "No ritmo atual, o uso pode ultrapassar os créditos incluídos.")
                 defaults.set(true, forKey: key)
             }
         }
-        let recentPeak = MetricsEngine.deltas(samples: samples)
+        // `spent > 0` evita o aviso "0 de 0 cr" quando o automático zera com a quota esgotada.
+        if let budget = metrics?.dailyBudget, budget.state == .over, budget.spent > 0 {
+            let key = "budget-notified-\(Self.dayKey(Date()))"
+            if !defaults.bool(forKey: key) {
+                notify(
+                    title: "Orçamento diário estourado",
+                    body: "Você usou \(Self.number(budget.spent)) de \(Self.number(budget.limit)) cr hoje."
+                )
+                defaults.set(true, forKey: key)
+            }
+        }
+        let recentPeak = (metrics?.deltas ?? [])
             .filter { $0.sample.date > Date().addingTimeInterval(-600) && !$0.duringAbsence }
             .reduce(0) { $0 + $1.amount }
         let lastPeak = defaults.double(forKey: "lastPeakNotification")
@@ -324,6 +457,41 @@ final class MonitorModel: ObservableObject {
         if recentPeak >= peakThreshold && now - lastPeak >= 1800 {
             notify(title: "Consumo alto", body: "Consumo alto: \(Self.number(recentPeak)) cr nos últimos 10 min.")
             defaults.set(now, forKey: "lastPeakNotification")
+        }
+    }
+
+    /// Compara a leitura nova com a anterior (antes de `snapshot` ser sobrescrito): novo ciclo, mudança
+    /// de créditos do plano e contador zerado antes do reset. Cada aviso uma vez por chave; nunca no demo.
+    private func evaluateSnapshotChange(from previous: UsageSnapshot, to current: UsageSnapshot) {
+        guard notificationsEnabled, !isDemo else { return }
+        let defaults = UserDefaults.standard
+        func once(_ key: String, title: String, body: String) {
+            guard !defaults.bool(forKey: key) else { return }
+            notify(title: title, body: body)
+            defaults.set(true, forKey: key)
+        }
+        let resetKey = current.resetDateKey
+        guard previous.resetDateKey == resetKey else {
+            once(
+                "cycle-notified-\(resetKey)", title: "Novo ciclo do Copilot",
+                body: "Ciclo anterior fechou em \(Self.number(previous.used)) de \(Self.number(previous.entitlement)) cr. "
+                    + "Agora: \(Self.number(max(0, current.quotaRemaining))) cr até \(Self.resetDay(current.resetDate))."
+            )
+            return
+        }
+        if current.entitlement != previous.entitlement {
+            once(
+                "entitlement-notified-\(resetKey)-\(Self.keyNumber(current.entitlement))",
+                title: "Créditos do plano mudaram",
+                body: "De \(Self.number(previous.entitlement)) para \(Self.number(current.entitlement)) cr por ciclo."
+            )
+        }
+        // Mesma regra de `MetricsEngine.deltas`: queda de mais de 1 cr é reset do contador.
+        if current.used < previous.used - 1 {
+            once(
+                "early-reset-\(resetKey)-\(Self.dayKey(Date()))", title: "Quota zerada antes do reset",
+                body: "O contador caiu de \(Self.number(previous.used)) para \(Self.number(current.used)) cr."
+            )
         }
     }
 
@@ -359,6 +527,20 @@ final class MonitorModel: ObservableObject {
         formatter.currencySymbol = "US$"
         formatter.maximumFractionDigits = 2
         return formatter.string(from: NSNumber(value: credits / 100)) ?? "US$ 0,00"
+    }
+
+    /// `01/10`: dia do reset em UTC, o calendário em que a API define `quota_reset_date`.
+    private static func resetDay(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "dd/MM"
+        return formatter.string(from: date)
+    }
+
+    /// Número estável para chaves de UserDefaults (`4000`, `1500.5`), sem separador de milhar.
+    private static func keyNumber(_ value: Double) -> String {
+        value.rounded() == value && abs(value) < 1e15 ? String(Int(value)) : String(value)
     }
 
     private static func dayKey(_ date: Date) -> String {
