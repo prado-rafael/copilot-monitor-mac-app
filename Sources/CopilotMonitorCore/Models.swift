@@ -31,6 +31,18 @@ public struct UsageSnapshot: Sendable {
         self.rawJSON = rawJSON
     }
 
+    /// Usa os valores da última amostra aceita se um cache antigo terminou numa leitura agora isolada.
+    /// O JSON original é preservado para diagnóstico, não reescrito como se fosse uma resposta da API.
+    public func reconciled(with sample: UsageSample?) -> UsageSnapshot {
+        guard let sample, used != sample.used || entitlement != sample.entitlement || resetDateKey != sample.resetDate else { return self }
+        return UsageSnapshot(
+            login: login, plan: plan, assignedDate: assignedDate,
+            resetDate: GitHubResponseParser.parseDate(sample.resetDate) ?? resetDate, resetDateKey: sample.resetDate,
+            entitlement: sample.entitlement, quotaRemaining: max(0, sample.entitlement - sample.used),
+            used: sample.used, overage: sample.overage, timestamp: sample.date, rawJSON: rawJSON
+        )
+    }
+
     public func sample(at date: Date = Date()) -> UsageSample {
         UsageSample(
             timestamp: Int64(date.timeIntervalSince1970), used: used,
@@ -103,12 +115,14 @@ public enum UsageParseError: Error, LocalizedError {
     case invalidJSON
     case missingField(String)
     case missingQuotaSnapshot
+    case ambiguousQuotaSnapshot
 
     public var errorDescription: String? {
         switch self {
         case .invalidJSON: return "A API do GitHub retornou um JSON inválido."
         case let .missingField(field): return "A resposta do GitHub não contém o campo obrigatório “\(field)”."
         case .missingQuotaSnapshot: return "A resposta não contém um snapshot de quota limitado."
+        case .ambiguousQuotaSnapshot: return "A resposta não contém premium_interactions e tem mais de uma quota limitada; não é seguro escolher uma."
         }
     }
 }

@@ -218,13 +218,17 @@ public enum MetricsEngine {
 
     public static func deltas(samples: [UsageSample], gapLimit: TimeInterval = 600) -> [UsageDelta] {
         let ordered = samples.sorted { $0.timestamp < $1.timestamp }
+        var highWaterUsed = ordered.first?.used ?? 0
         return ordered.enumerated().map { index, sample in
             guard index > 0 else {
                 return UsageDelta(sample: sample, amount: 0, duringAbsence: false, previousTimestamp: nil)
             }
             let previous = ordered[index - 1]
-            let reset = sample.resetDate != previous.resetDate || sample.used < previous.used - 1
-            let amount = reset ? sample.used : max(0, sample.used - previous.used)
+            let reset = sample.resetDate != previous.resetDate
+            // Uma correção para baixo no mesmo ciclo não é consumo nem reset. Preservar a maior
+            // referência evita recontar créditos quando o contador se recupera, mesmo fora do store.
+            let amount = reset ? sample.used : max(0, sample.used - highWaterUsed)
+            highWaterUsed = reset ? sample.used : max(highWaterUsed, sample.used)
             return UsageDelta(
                 sample: sample, amount: amount,
                 duringAbsence: TimeInterval(sample.timestamp - previous.timestamp) > gapLimit,

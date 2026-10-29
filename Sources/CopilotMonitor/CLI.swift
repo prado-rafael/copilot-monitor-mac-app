@@ -54,6 +54,10 @@ enum CLIRunner {
             print(loaded.settings.dailyBudget == .off ? "diário: desligado" : "diário: sem dias úteis até o reset")
         }
         print(budgetLine("ciclo", spent: cycle.spent, limit: cycle.limit, percent: cycle.percent, state: cycle.state))
+        if let pending = report.pendingReading {
+            printError("aviso: leitura suspeita ignorada; \(pending) Exibindo os últimos dados válidos.")
+            return 2
+        }
         if report.stale, let lastUpdated = report.lastUpdated {
             let minutes = (report.generated.timeIntervalSince(lastUpdated) / 60).rounded(.down)
             printError("aviso: última leitura há \(MonitorModel.number(minutes)) min; o Copilot Monitor está aberto?")
@@ -120,8 +124,14 @@ enum CLIRunner {
         guard !samples.isEmpty else {
             throw NoData("sem dados: nenhuma leitura nos últimos \(MetricsEngine.historyDays) dias.")
         }
+        let pending = try store.metadata(forKey: SQLiteUsageStore.pendingReadingKey)
+            .flatMap { String(data: $0, encoding: .utf8) }
+            .flatMap(UsageAnomalyReason.init(rawValue:))?.message
+        let cacheMismatch = snapshot.used != samples.last?.used || snapshot.entitlement != samples.last?.entitlement
+            || snapshot.resetDateKey != samples.last?.resetDate
         let report = UsageReport.make(
-            samples: samples, snapshot: snapshot, cycles: try store.cycles(), settings: settings, now: now
+            samples: samples, snapshot: snapshot, cycles: try store.cycles(), settings: settings,
+            pendingReading: pending ?? (cacheMismatch ? "A última resposta diverge do histórico válido." : nil), now: now
         )
         return Loaded(report: report, settings: settings)
     }
@@ -146,7 +156,8 @@ enum CLIRunner {
                        com 0; em caso de erro imprime {"error": "mensagem"}.
           --compact    Com --json, imprime o JSON numa linha só.
           --check      Orçamento diário e do ciclo, cada um com OK, ATENÇÃO ou ESTOUROU.
-                       Sai com 1 se algum estourou, 2 se não há dados e 0 caso contrário.
+                       Sai com 1 se algum estourou, 2 sem dados ou com leitura suspeita pendente,
+                       e 0 caso contrário.
           --help, -h   Mostra esta ajuda.
 
         Dados: ~/Library/Application Support/CopilotMonitor/usage.sqlite

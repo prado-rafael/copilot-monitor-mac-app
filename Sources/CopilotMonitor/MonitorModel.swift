@@ -56,6 +56,7 @@ final class MonitorModel: ObservableObject {
     }
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var errorMessage: String?
+    @Published private(set) var pendingReadingMessage: String?
     @Published private(set) var notificationError: String?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isSleeping = false
@@ -91,6 +92,7 @@ final class MonitorModel: ObservableObject {
     private let store: SQLiteUsageStore
     private let tokenResolver = TokenResolver()
     private let client = GitHubCopilotClient()
+    private var readingValidator = UsageReadingValidator()
     private var etag: String?
     private var failures = 0
     private var pollingTask: Task<Void, Never>?
@@ -145,6 +147,18 @@ final class MonitorModel: ObservableObject {
                 try store.backfillCycles(excluding: currentKey)
             }
             cycles = try store.cycles()
+            if let rawReason = try store.metadata(forKey: SQLiteUsageStore.pendingReadingKey),
+               let reason = String(data: rawReason, encoding: .utf8).flatMap(UsageAnomalyReason.init(rawValue:)) {
+                pendingReadingMessage = reason.message
+            }
+            if let cached = snapshot, let lastValid = samples.last {
+                if cached.used != lastValid.used || cached.entitlement != lastValid.entitlement || cached.resetDateKey != lastValid.resetDate {
+                    snapshot = cached.reconciled(with: lastValid)
+                    pendingReadingMessage = pendingReadingMessage ?? "A última resposta diverge do histórico válido; aguardando nova leitura."
+                }
+            }
+            if pendingReadingMessage != nil { etag = nil }
+            readingValidator = UsageReadingValidator(lastAccepted: samples.last, apiTimestamp: snapshot?.timestamp)
         }
         persistSettings()
     }
@@ -186,7 +200,7 @@ final class MonitorModel: ObservableObject {
         if currentEntitlement > 0 && currentUsed >= currentEntitlement { return .systemRed }
         // O fallback do ciclo anterior não acende o laranja no primeiro dia de um ciclo novo.
         let projectedOver = metrics.projectionSource == .linear && (metrics.projectedAtReset ?? 0) > currentEntitlement
-        if projectedOver || peakIsActive || metrics.dailyBudget?.state == .over {
+        if projectedOver || peakIsActive || metrics.dailyBudget?.state == .over || pendingReadingMessage != nil {
             return .systemOrange
         }
         return .labelColor
@@ -280,39 +294,58 @@ final class MonitorModel: ObservableObject {
                 result = try await client.fetch(token: token, etag: etag)
             }
 
-            let newSnapshot: UsageSnapshot
-            switch result {
-            case let .modified(value, newETag):
-                newSnapshot = value
-                etag = newETag
-                try store.setMetadata(value.rawJSON, forKey: "lastResponse")
-                if let newETag { try store.setMetadata(Data(newETag.utf8), forKey: "etag") }
-            case let .unchanged(newETag):
-                guard let snapshot else { throw MonitorError.noCachedResponse }
-                newSnapshot = snapshot
-                etag = newETag
-            }
-            let sample = newSnapshot.sample()
-            try store.append(sample)
-            if case .unchanged = result {
-                try store.setMetadata(Data(newSnapshot.rawJSON), forKey: "lastResponse")
-            }
-            if let previous = snapshot {
-                if previous.resetDateKey != newSnapshot.resetDateKey { recordClosedCycle(previous) }
-                evaluateSnapshotChange(from: previous, to: newSnapshot)
-            }
-            self.snapshot = newSnapshot
-            lastUpdated = Date()
-            errorMessage = nil
-            failures = 0
-            samples.append(sample)
-            // 91 dias a 60 s ≈ 131 mil leituras: o calendário de 13 semanas cabe inteiro.
-            samples = Array(samples.suffix(150_000))
-            evaluateNotifications()
+            try apply(result)
         } catch {
             failures = min(failures + 1, 4)
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Compartilhado pelo polling e pelos testes HTTP: nenhum consumidor vê uma leitura pendente.
+    func apply(_ result: GitHubFetchResult, at now: Date = Date()) throws {
+        let newSnapshot: UsageSnapshot
+        let sample: UsageSample
+        switch result {
+        case let .modified(value, newETag):
+            sample = value.sample(at: now)
+            var candidateValidator = readingValidator
+            switch candidateValidator.evaluate(sample, apiTimestamp: value.timestamp) {
+            case let .quarantined(reason):
+                try store.quarantine(value, reason: reason, at: now)
+                readingValidator = candidateValidator
+                etag = nil
+                pendingReadingMessage = reason.message
+                errorMessage = nil
+                failures = 0
+                return
+            case .accepted:
+                try store.recordAccepted(value, at: now, etag: newETag)
+                readingValidator = candidateValidator
+                newSnapshot = value
+                etag = newETag
+                pendingReadingMessage = nil
+            }
+        case let .unchanged(newETag):
+            // Um 304 não é uma confirmação independente nem atualiza a idade dos dados pendentes.
+            guard pendingReadingMessage == nil else { etag = nil; return }
+            guard let snapshot else { throw MonitorError.noCachedResponse }
+            newSnapshot = snapshot
+            sample = snapshot.sample(at: now)
+            try store.append(sample)
+            etag = newETag
+        }
+        if let previous = snapshot {
+            if previous.resetDateKey != newSnapshot.resetDateKey { recordClosedCycle(previous) }
+            evaluateSnapshotChange(from: previous, to: newSnapshot)
+        }
+        self.snapshot = newSnapshot
+        lastUpdated = now
+        errorMessage = nil
+        failures = 0
+        samples.append(sample)
+        // 91 dias a 60 s ≈ 131 mil leituras: o calendário de 13 semanas cabe inteiro.
+        samples = Array(samples.suffix(150_000))
+        evaluateNotifications()
     }
 
     /// Grava o ciclo que acabou de fechar e recarrega `cycles`. Falha aqui não interrompe a coleta:
@@ -486,10 +519,10 @@ final class MonitorModel: ObservableObject {
                 body: "De \(Self.number(previous.entitlement)) para \(Self.number(current.entitlement)) cr por ciclo."
             )
         }
-        // Mesma regra de `MetricsEngine.deltas`: queda de mais de 1 cr é reset do contador.
+        // A queda já passou pela confirmação; não é tratada como reset do ciclo nem como consumo.
         if current.used < previous.used - 1 {
             once(
-                "early-reset-\(resetKey)-\(Self.dayKey(Date()))", title: "Quota zerada antes do reset",
+                "counter-correction-\(resetKey)-\(Self.dayKey(Date()))", title: "Contador corrigido pelo GitHub",
                 body: "O contador caiu de \(Self.number(previous.used)) para \(Self.number(current.used)) cr."
             )
         }

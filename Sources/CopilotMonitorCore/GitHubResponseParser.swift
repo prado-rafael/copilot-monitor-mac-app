@@ -22,11 +22,12 @@ public enum GitHubResponseParser {
         if let premium = snapshots["premium_interactions"] as? [String: Any] {
             quota = premium
         } else {
-            quota = snapshots.values
-                .compactMap { $0 as? [String: Any] }
-                .first { !boolValue($0["unlimited"]) }
+            let limited = snapshots.values.compactMap { $0 as? [String: Any] }
+                .filter { ($0["unlimited"] as? Bool) == false }
+            guard limited.count <= 1 else { throw UsageParseError.ambiguousQuotaSnapshot }
+            quota = limited.first
         }
-        guard let quota else { throw UsageParseError.missingQuotaSnapshot }
+        guard let quota, !boolValue(quota["unlimited"]) else { throw UsageParseError.missingQuotaSnapshot }
         guard let entitlement = numberValue(quota["entitlement"]) else {
             throw UsageParseError.missingField("quota_snapshots.*.entitlement")
         }

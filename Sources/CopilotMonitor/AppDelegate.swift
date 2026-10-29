@@ -70,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.title = model.statusTitle
         button.contentTintColor = model.statusColor
         var toolTip = model.isDemo ? "Copilot Monitor · modo demo" : (model.offlineDescription() ?? "Copilot Monitor")
+        if let pending = model.pendingReadingMessage { toolTip += "\nLeitura suspeita ignorada · \(pending)" }
         if let session = model.metrics?.activeSession {
             toolTip += "\nSessão ativa · \(MonitorModel.number(session.credits)) cr"
         }

@@ -94,6 +94,8 @@ public struct UsageReport: Codable, Sendable, Equatable {
     public let plan: String
     /// `lastUpdated` há mais de 5 min (ou sem nenhuma leitura): o app provavelmente não está coletando.
     public let stale: Bool
+    /// Motivo da leitura suspeita pendente; os números continuam sendo os últimos aceitos.
+    public let pendingReading: String?
     /// Data da amostra mais recente.
     public let lastUpdated: Date?
     public let cycle: Cycle
@@ -109,6 +111,7 @@ public struct UsageReport: Codable, Sendable, Equatable {
         try container.encode(login, forKey: .login)
         try container.encode(plan, forKey: .plan)
         try container.encode(stale, forKey: .stale)
+        try container.encode(pendingReading, forKey: .pendingReading)
         try container.encode(lastUpdated, forKey: .lastUpdated)
         try container.encode(cycle, forKey: .cycle)
         try container.encode(today, forKey: .today)
@@ -122,8 +125,9 @@ public struct UsageReport: Codable, Sendable, Equatable {
     /// sessão ativa e sequências sobre todas as amostras, orçamento e intervalo de sessão de `settings`.
     public static func make(
         samples: [UsageSample], snapshot: UsageSnapshot, cycles: [CycleSummary],
-        settings: MonitorSettings, now: Date = Date(), calendar: Calendar = .current
+        settings: MonitorSettings, pendingReading: String? = nil, now: Date = Date(), calendar: Calendar = .current
     ) -> UsageReport {
+        let snapshot = snapshot.reconciled(with: samples.last)
         let metrics = MetricsEngine.analyze(
             samples: samples, now: now, assignedDate: snapshot.assignedDate,
             resetDate: snapshot.resetDate, entitlement: snapshot.entitlement, period: .today,
@@ -141,7 +145,8 @@ public struct UsageReport: Codable, Sendable, Equatable {
             generated: now,
             login: snapshot.login,
             plan: snapshot.plan,
-            stale: lastUpdated.map { now.timeIntervalSince($0) > staleAfter } ?? true,
+            stale: pendingReading != nil || (lastUpdated.map { now.timeIntervalSince($0) > staleAfter } ?? true),
+            pendingReading: pendingReading,
             lastUpdated: lastUpdated,
             cycle: Cycle(
                 used: round(metrics.cycleUsed),

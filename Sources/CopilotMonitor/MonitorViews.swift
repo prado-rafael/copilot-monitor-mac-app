@@ -597,6 +597,10 @@ struct MonitorPopoverView: View {
     private var footer: some View {
         VStack(spacing: 8) {
             Divider()
+            if let message = model.pendingReadingMessage {
+                Label("Leitura suspeita ignorada · \(message) Exibindo os últimos dados válidos.", systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
+            }
             if let status = model.offlineDescription() {
                 Label(status, systemImage: "wifi.slash")
                     .font(.caption2).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .leading)

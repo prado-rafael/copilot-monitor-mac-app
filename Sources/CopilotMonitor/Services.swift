@@ -136,8 +136,10 @@ enum GitHubFetchResult {
 }
 
 struct GitHubCopilotClient {
+    var endpoint = URL(string: "https://api.github.com/copilot_internal/user")!
+
     func fetch(token: String, etag: String?) async throws -> GitHubFetchResult {
-        var request = URLRequest(url: URL(string: "https://api.github.com/copilot_internal/user")!)
+        var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")

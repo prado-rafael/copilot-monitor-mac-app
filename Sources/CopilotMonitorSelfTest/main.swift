@@ -1,10 +1,155 @@
 import CopilotMonitorCore
 import Foundation
 
+/// Regressões dos placeholders de quota observados no histórico real.
+enum UsageValidationTests {
+    static func run() throws {
+        try sameCycleDecreaseIsNotAReset()
+        try historicalPlaceholdersAreQuarantined()
+        try validateLiveReadings()
+        try validateIndependentConfirmation()
+        try persistQuarantineWithoutReplacingGoodCache()
+        try deterministicQuotaSelection()
+    }
+
+    private static func sameCycleDecreaseIsNotAReset() throws {
+        let values = [100.0, 0, 110, 90, 110, 115]
+        let samples = values.enumerated().map { reading(Int64($0.offset * 60), $0.element) }
+        let amounts = MetricsEngine.deltas(samples: samples).map(\.amount)
+        try check(amounts == [0, 0, 10, 0, 0, 5], "same-cycle corrections never re-count previous usage")
+        let nextCycle = reading(360, 3, reset: "2026-12-01")
+        try check(MetricsEngine.deltas(samples: samples + [nextCycle]).last?.amount == 3, "actual cycle reset still counts new usage")
+    }
+
+    private static func historicalPlaceholdersAreQuarantined() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("usage.sqlite")
+        let baseline = reading(1000, 22244.1, entitlement: 25000)
+        let placeholder = reading(1060, 0, entitlement: 1)
+        let recovery = reading(1120, 22363.4, entitlement: 25000)
+        do {
+            let store = try SQLiteUsageStore(url: url)
+            try store.append(contentsOf: [baseline, placeholder, recovery])
+        }
+        let reopened = try SQLiteUsageStore(url: url)
+        let validated = try reopened.samples()
+        try check(validated == [baseline, recovery], "historical placeholder excluded after reopen")
+        try check(abs(MetricsEngine.deltas(samples: validated).reduce(0) { $0 + $1.amount } - 119.3) < 0.00001, "historical recovery counts only new consumption")
+        try check(try reopened.samples(includingQuarantined: true) == [baseline, placeholder, recovery], "original readings are preserved")
+        try check(try reopened.quarantinedSampleCount() == 1, "historical migration is idempotent")
+        try reopened.restoreQuarantinedSample(rowID: 2)
+        let restored = try SQLiteUsageStore(url: url)
+        try check(try restored.samples().count == 3 && restored.quarantinedSampleCount() == 0, "manual restoration survives migration")
+
+        let longRun = [baseline] + (1...142).map { reading(1000 + Int64($0) * 60, 0, entitlement: 0) }
+            + [reading(10000, 22363.4, entitlement: 25000), reading(10060, 0, entitlement: 0, reset: "2026-12-01")]
+        try check(UsageReadingValidator.historicalPlaceholders(in: longRun) == Array(1...142), "long placeholders excluded but real zero at next cycle preserved")
+        try check(UsageReadingValidator.historicalPlaceholders(in: [reading(1000, 0, entitlement: 1), reading(1060, 0, entitlement: 0)]).isEmpty, "legitimate low quotas without prior paid usage are preserved")
+    }
+
+    private static func validateLiveReadings() throws {
+        var validator = UsageReadingValidator()
+        func evaluate(_ value: UsageSample) -> UsageReadingDecision {
+            validator.evaluate(value, apiTimestamp: value.date)
+        }
+        try check(evaluate(reading(1000, 100)) == .accepted, "initial reading accepted")
+        for timestamp in stride(from: Int64(1060), through: 10000, by: 60) {
+            try check(evaluate(reading(timestamp, 0, entitlement: 1)) == .quarantined(.quotaCollapse), "repeated placeholders never become confirmed")
+        }
+        try check(validator.lastAccepted?.used == 100, "suspect reading never advances baseline")
+        try check(evaluate(reading(10060, 110)) == .accepted, "recovery accepted from last good baseline")
+        try check(evaluate(reading(10120, 115, entitlement: 2000)) == .accepted, "ordinary plan upgrade accepted")
+        try check(evaluate(reading(10180, 120, entitlement: 50)) == .accepted, "legitimate overage and plan downgrade accepted")
+        try check(evaluate(reading(10240, 0, entitlement: 0, reset: "2026-12-01")) == .accepted, "true new cycle accepts zero quota")
+        try check(evaluate(reading(10300, 120)) == .quarantined(.olderCycle), "older cycle cannot replace new cycle")
+        try check(evaluate(reading(10360, -1)) == .quarantined(.invalidValues), "negative usage rejected")
+        try check(evaluate(reading(10420, 0, entitlement: -1)) == .quarantined(.invalidValues), "negative entitlement rejected")
+        try check(evaluate(reading(10480, .infinity)) == .quarantined(.invalidValues), "non-finite usage rejected")
+        try check(validator.evaluate(reading(10540, 2, reset: "2026-12-01"), apiTimestamp: Date(timeIntervalSince1970: 10000)) == .quarantined(.staleResponse), "old API response rejected")
+    }
+
+    private static func validateIndependentConfirmation() throws {
+        let baseline = reading(1000, 100)
+        var validator = UsageReadingValidator(lastAccepted: baseline, apiTimestamp: baseline.date)
+        try check(validator.evaluate(reading(1060, 60000), apiTimestamp: Date(timeIntervalSince1970: 1060)) == .quarantined(.suddenIncrease), "large upward spike waits for confirmation")
+        try check(validator.evaluate(reading(1120, 60000), apiTimestamp: Date(timeIntervalSince1970: 1060)) == .quarantined(.suddenIncrease), "same payload timestamp does not confirm")
+        try check(validator.evaluate(reading(1180, 110), apiTimestamp: Date(timeIntervalSince1970: 1180)) == .accepted, "reverting spike leaves baseline clean")
+        try check(validator.evaluate(reading(1240, 60000), apiTimestamp: Date(timeIntervalSince1970: 1240)) == .quarantined(.suddenIncrease), "legitimate high usage initially pending")
+        try check(validator.evaluate(reading(1300, 60010), apiTimestamp: Date(timeIntervalSince1970: 1300)) == .accepted, "fresh coherent payload confirms usage beyond quota")
+        try check(validator.evaluate(reading(1360, 50000), apiTimestamp: Date(timeIntervalSince1970: 1360)) == .quarantined(.counterDecrease), "same-cycle correction initially pending")
+        try check(validator.evaluate(reading(1420, 50005), apiTimestamp: Date(timeIntervalSince1970: 1420)) == .accepted, "fresh coherent payload confirms real downward correction")
+        var afterAbsence = UsageReadingValidator(lastAccepted: baseline)
+        try check(afterAbsence.evaluate(reading(10000, 10000), apiTimestamp: Date(timeIntervalSince1970: 10000)) == .accepted, "catch-up allowance grows with time since last response")
+    }
+
+    private static func persistQuarantineWithoutReplacingGoodCache() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("usage.sqlite")
+        let baseline = snapshot(reading(1000, 100))
+        let placeholder = snapshot(reading(1060, 0, entitlement: 1))
+        let recovery = snapshot(reading(1120, 110))
+        let store = try SQLiteUsageStore(url: url)
+        try store.recordAccepted(baseline, at: baseline.timestamp, etag: "good-etag")
+        try store.quarantine(placeholder, reason: .quotaCollapse, at: placeholder.timestamp)
+        try check(try store.samples().map(\.used) == [100], "quarantined readings never reach consumers")
+        try check(try store.samples(includingQuarantined: true).count == 2, "suspect reading saved for audit")
+        try check(try store.metadata(forKey: "lastResponse") == baseline.rawJSON, "last-known-good response preserved")
+        try check(try store.metadata(forKey: "etag") == nil, "suspect etag is not reused")
+        try check(try store.metadata(forKey: SQLiteUsageStore.pendingReadingKey) == Data("quotaCollapse".utf8), "pending state persists across restart")
+        try check(try store.latestSample()?.used == 100, "last valid update excludes quarantine")
+        let reopened = try SQLiteUsageStore(url: url)
+        try check(try reopened.quarantinedSampleCount() == 1, "quarantine survives restart")
+        try reopened.recordAccepted(recovery, at: recovery.timestamp, etag: "recovered-etag")
+        try check(try reopened.metadata(forKey: SQLiteUsageStore.pendingReadingKey) == nil, "recovery clears pending state")
+        try check(try reopened.latestSample()?.used == 110 && reopened.quarantinedSampleCount() == 1, "recovery preserves audit trail")
+        try reopened.removeAllSamples()
+        try check(try reopened.samples(includingQuarantined: true).isEmpty && reopened.quarantinedSampleCount() == 0, "removing demo samples clears stale rowid exclusions")
+    }
+
+    private static func deterministicQuotaSelection() throws {
+        func parse(_ quotas: [String: Any]) throws -> UsageSnapshot {
+            let root: [String: Any] = ["assigned_date": "2026-10-01", "quota_reset_date": "2026-11-01", "quota_snapshots": quotas]
+            return try GitHubResponseParser.parse(JSONSerialization.data(withJSONObject: root))
+        }
+        let paid: [String: Any] = ["unlimited": false, "entitlement": 1000, "quota_remaining": 900]
+        let unknown: [String: Any] = ["entitlement": 1, "quota_remaining": 1]
+        try check(try parse(["paid": paid, "unknown": unknown]).used == 100, "fallback requires explicit limited quota")
+        try check(try parse(["premium_interactions": paid, "other": paid]).used == 100, "premium quota takes priority")
+        do {
+            _ = try parse(["a": paid, "b": paid])
+            try check(false, "ambiguous quota must fail")
+        } catch UsageParseError.ambiguousQuotaSnapshot {}
+        do {
+            _ = try parse(["unknown": unknown])
+            try check(false, "unknown unlimited flag must not be interpreted as limited")
+        } catch UsageParseError.missingQuotaSnapshot {}
+    }
+
+    private static func snapshot(_ sample: UsageSample) -> UsageSnapshot {
+        UsageSnapshot(login: "test", plan: "test", assignedDate: sample.date, resetDate: GitHubResponseParser.parseDate(sample.resetDate)!,
+                      resetDateKey: sample.resetDate, entitlement: sample.entitlement, quotaRemaining: max(0, sample.entitlement - sample.used),
+                      used: sample.used, overage: sample.overage, timestamp: sample.date,
+                      rawJSON: Data("{\"testUsage\":\(sample.used)}".utf8))
+    }
+
+    private static func reading(_ timestamp: Int64, _ used: Double, entitlement: Double = 1000, reset: String = "2026-11-01") -> UsageSample {
+        UsageSample(timestamp: timestamp, used: used, entitlement: entitlement, overage: max(0, used - entitlement), resetDate: reset)
+    }
+
+    private static func check(_ condition: Bool, _ message: String) throws {
+        guard condition else {
+            throw NSError(domain: "UsageValidationTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Falhou: \(message)"])
+        }
+    }
+}
+
 @main
 struct CopilotMonitorSelfTest {
     static func main() {
         do {
+            try UsageValidationTests.run()
             try testDeltasBaselineResetAndAbsence()
             try testSessionGrouping()
             try testPaceProjectionAndWeekdays()
@@ -485,7 +630,7 @@ struct CopilotMonitorSelfTest {
         try check(["cycle", "today", "burn", "streak"].allSatisfy { json[$0] is [String: Any] }, "report sections")
         try check(Set(json.keys) == [
             "generated", "login", "plan", "stale", "lastUpdated", "cycle", "today", "yesterday", "burn",
-            "activeSession", "streak"
+            "activeSession", "streak", "pendingReading"
         ], "report keys")
         let today = json["today"] as? [String: Any]
         let budget = today?["budget"] as? [String: Any]
@@ -507,6 +652,12 @@ struct CopilotMonitorSelfTest {
         try check(!compact.contains("\n") && order.count == 4 && order == order.sorted(), "report compact sorted keys")
         let decoded = try UsageReport.decode(over.jsonData())
         try check(decoded == over, "report round trip")
+        let pending = UsageReport.make(samples: samples, snapshot: snapshot, cycles: cycles, settings: .defaults,
+                                       pendingReading: "Confirmando quota", now: now, calendar: calendar)
+        try check(pending.stale && pending.pendingReading == "Confirmando quota" && pending.cycle.used == over.cycle.used, "pending report preserves valid values but marks uncertainty")
+        let reconciled = UsageReport.make(samples: samples, snapshot: snapshot.reconciled(with: sample(0, 0, key)),
+                                          cycles: cycles, settings: .defaults, now: now, calendar: calendar)
+        try check(reconciled.cycle.used == over.cycle.used && reconciled.cycle.entitlement == over.cycle.entitlement, "report reconciles obsolete cached quota with accepted history")
 
         // Orçamento desligado → `budget: null` (chave presente); manual folgado → ok; 80% → warning.
         let off = try object(report(.off))
