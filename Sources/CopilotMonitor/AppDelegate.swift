@@ -2,11 +2,13 @@ import AppKit
 import Combine
 import CopilotMonitorCore
 import SwiftUI
+import UserNotifications
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var model: MonitorModel?
     private var statusItem: NSStatusItem?
+    private var statusSymbol: String?
     private let popover = NSPopover()
     private var preferencesWindow: NSWindow?
     private var preferencesObserver: NSObjectProtocol?
@@ -28,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             configureStatusItem(model)
             configurePopover(model)
+            if model.supportsNotifications { UNUserNotificationCenter.current().delegate = self }
             model.start()
         } catch {
             let alert = NSAlert()
@@ -43,10 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.isVisible = true
         guard let button = item.button else { return }
-        button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Copilot Monitor")
         button.imagePosition = .imageLeading
         button.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
-        button.setAccessibilityLabel("Copilot Monitor")
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.target = self
         button.action = #selector(statusItemClicked(_:))
@@ -67,14 +68,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem() {
         guard let model, let button = statusItem?.button else { return }
+        let alert = model.cycleQuotaAlert
+        let symbol = alert?.symbol ?? "sparkles"
+        if statusSymbol != symbol {
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            if let alert, let colored = image?.withSymbolConfiguration(.init(paletteColors: [alert.color])) {
+                colored.isTemplate = false
+                button.image = colored
+            } else {
+                button.image = image
+            }
+            statusSymbol = symbol
+        }
         button.title = model.statusTitle
         button.contentTintColor = model.statusColor
         var toolTip = model.isDemo ? "Copilot Monitor · modo demo" : (model.offlineDescription() ?? "Copilot Monitor")
+        if let alert {
+            let title = model.quotaAlertTitle(alert)
+            button.setAccessibilityLabel("Copilot Monitor · \(title) · \(model.quotaAlertDetail)")
+            toolTip += "\n\(title)\n\(model.quotaAlertDetail)"
+        } else {
+            button.setAccessibilityLabel("Copilot Monitor")
+        }
         if let pending = model.pendingReadingMessage { toolTip += "\nLeitura suspeita ignorada · \(pending)" }
         if let session = model.metrics?.activeSession {
             toolTip += "\nSessão ativa · \(MonitorModel.number(session.credits)) cr"
         }
         button.toolTip = toolTip
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter, willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
     }
 
     deinit {

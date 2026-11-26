@@ -23,6 +23,18 @@ struct MonitorPopoverView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            if let alert = model.cycleQuotaAlert {
+                quotaBanner(alert)
+                    .padding([.top, .horizontal], 16)
+            }
+            content
+        }
+        .frame(width: 380, height: 620)
+        .background(.background)
+    }
+
+    private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
@@ -47,8 +59,29 @@ struct MonitorPopoverView: View {
             }
             .padding(16)
         }
-        .frame(width: 380, height: 620)
-        .background(.background)
+    }
+
+    private func quotaBanner(_ alert: CycleQuotaAlert) -> some View {
+        let tint = Color(nsColor: alert.color)
+        return HStack(alignment: .top, spacing: 9) {
+            Image(systemName: alert.symbol)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(model.quotaAlertTitle(alert)).font(.subheadline.weight(.semibold))
+                Text(model.quotaAlertDetail).font(.caption).foregroundStyle(.secondary)
+                if model.errorMessage != nil || model.pendingReadingMessage != nil {
+                    Text("Última leitura válida").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8).strokeBorder(tint.opacity(0.45))
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private var header: some View {
@@ -867,6 +900,8 @@ struct PreferencesView: View {
                         UserDefaults.standard.set(enabled, forKey: "notificationsEnabled")
                         if enabled { model.requestNotificationPermission() }
                     }
+                Text("Quota do ciclo: avisos em 85%, 90%, 95% e 100% (com som nos dois últimos, se permitido pelo macOS).")
+                    .font(.caption).foregroundStyle(.secondary)
                 if let message = model.notificationError {
                     Text(message).font(.caption).foregroundStyle(.orange)
                 }

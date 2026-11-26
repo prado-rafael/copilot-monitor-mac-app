@@ -150,6 +150,7 @@ struct CopilotMonitorSelfTest {
     static func main() {
         do {
             try UsageValidationTests.run()
+            try testCycleQuotaAlerts()
             try testDeltasBaselineResetAndAbsence()
             try testSessionGrouping()
             try testPaceProjectionAndWeekdays()
@@ -917,6 +918,21 @@ struct CopilotMonitorSelfTest {
 
     private static func date(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value)!
+    }
+
+    private static func testCycleQuotaAlerts() throws {
+        for (percent, expected): (Double, CycleQuotaAlert?) in [
+            (0, nil), (84.99, nil), (85, .warning), (89.99, .warning), (90, .critical),
+            (94.99, .critical), (95, .urgent), (98, .urgent), (99.99, .urgent),
+            (100, .exhausted), (110, .exhausted), (.infinity, nil), (.nan, nil)
+        ] {
+            try check(CycleQuotaAlert.reached(at: percent) == expected, "cycle quota threshold at \(percent)%")
+        }
+        try check(CycleQuotaAlert.reached(at: 98, after: 80) == .urgent, "skipping thresholds sends only the highest alert")
+        try check(CycleQuotaAlert.reached(at: 98, after: 90) == .urgent, "legacy 90% notification does not suppress the 95% reminder")
+        try check(CycleQuotaAlert.reached(at: 98, after: 95) == nil, "refreshing does not repeat a quota alert")
+        try check(CycleQuotaAlert.reached(at: 86, after: 95) == nil, "a correction does not rearm lower alerts")
+        try check(CycleQuotaAlert.reached(at: 100, after: 95) == .exhausted, "exhaustion sends a new alert")
     }
 
     private static func check(_ condition: @autoclosure () -> Bool, _ name: String) throws {

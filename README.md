@@ -10,7 +10,9 @@ App de barra de menus para acompanhar os créditos de uso do Copilot pela API do
 - Sessão ativa no cabeçalho e no tooltip da barra.
 - Comparação com o ciclo anterior no mesmo ponto; no início de um ciclo, a projeção usa o ciclo anterior como referência.
 - Calendário de atividade das últimas 13 semanas e sparkline dos últimos 14 dias.
-- Notificações de novo ciclo, mudança nos créditos do plano e correção confirmada do contador, além das de quota, projeção, orçamento e pico.
+- Ícone amarelo a partir de 85% da quota do ciclo e vermelho a partir de 90%, com banner fixo no topo do painel mostrando o percentual, os créditos restantes e a data do reset (UTC).
+- Notificações de quota em 85%, 90%, 95% e 100%, sem repetição no ciclo e com som a partir de 95% (se permitido pelo macOS). Se uma leitura saltar vários limiares, só o maior é anunciado.
+- Notificações de novo ciclo, mudança nos créditos do plano e correção confirmada do contador, além das de projeção, orçamento e pico.
 - Proteção contra leituras anômalas da API, com quarentena auditável e recuperação do histórico sem apagar amostras.
 
 ## Compilar
