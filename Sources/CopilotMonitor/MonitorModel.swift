@@ -30,6 +30,27 @@ enum DailyBudgetMode: String, CaseIterable, Identifiable {
     }
 }
 
+extension CycleQuotaAlert {
+    var color: NSColor { self == .warning ? .systemYellow : .systemRed }
+
+    var symbol: String {
+        switch self {
+        case .warning: return "exclamationmark.triangle.fill"
+        case .critical, .urgent: return "exclamationmark.circle.fill"
+        case .exhausted: return "exclamationmark.octagon.fill"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .warning: return "Quota do Copilot: atenção"
+        case .critical: return "Quota do Copilot em nível crítico"
+        case .urgent: return "Quota do Copilot quase no fim"
+        case .exhausted: return "Quota do Copilot esgotada"
+        }
+    }
+}
+
 private struct MetricsCacheKey: Hashable {
     let period: UsagePeriod
     let periodOffset: Int
@@ -99,6 +120,7 @@ final class MonitorModel: ObservableObject {
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var refreshInProgress = false
+    private var quotaNotificationsInFlight = Set<String>()
     private var samplesVersion = 0
     private var metricsCache: [MetricsCacheKey: UsageMetrics] = [:]
     private static let metricsCacheLimit = 8
@@ -178,6 +200,19 @@ final class MonitorModel: ObservableObject {
         return currentUsed / currentEntitlement * 100
     }
 
+    var cycleQuotaAlert: CycleQuotaAlert? { CycleQuotaAlert.reached(at: cyclePercent) }
+
+    func quotaAlertTitle(_ alert: CycleQuotaAlert) -> String {
+        "\(alert.title) · \(Self.number(cyclePercent))%"
+    }
+
+    var quotaAlertDetail: String {
+        guard let snapshot else { return "" }
+        let balance = snapshot.entitlement - snapshot.used
+        let credits = balance < 0 ? "\(Self.number(-balance)) cr acima da quota" : "Restam \(Self.number(balance)) cr"
+        return "\(credits) · reset em \(Self.resetDay(snapshot.resetDate)) (UTC)"
+    }
+
     var statusTitle: String {
         guard snapshot != nil else { return "—" }
         let today = metrics(for: .today)
@@ -196,8 +231,8 @@ final class MonitorModel: ObservableObject {
     }
 
     var statusColor: NSColor {
+        if let alert = cycleQuotaAlert { return alert.color }
         guard let metrics else { return .secondaryLabelColor }
-        if currentEntitlement > 0 && currentUsed >= currentEntitlement { return .systemRed }
         // O fallback do ciclo anterior não acende o laranja no primeiro dia de um ciclo novo.
         let projectedOver = metrics.projectionSource == .linear && (metrics.projectedAtReset ?? 0) > currentEntitlement
         if projectedOver || peakIsActive || metrics.dailyBudget?.state == .over || pendingReadingMessage != nil {
@@ -241,7 +276,7 @@ final class MonitorModel: ObservableObject {
 
     func start() {
         guard pollingTask == nil else { return }
-        if notificationsEnabled && !UserDefaults.standard.bool(forKey: "notificationPrompted") {
+        if supportsNotifications && notificationsEnabled && !UserDefaults.standard.bool(forKey: "notificationPrompted") {
             requestNotificationPermission()
             UserDefaults.standard.set(true, forKey: "notificationPrompted")
         }
@@ -404,7 +439,11 @@ final class MonitorModel: ObservableObject {
         }
     }
 
+    // O binário avulso (swift run) não tem identidade para o Notification Center.
+    var supportsNotifications: Bool { !isDemo && Bundle.main.bundleIdentifier != nil }
+
     func requestNotificationPermission() {
+        guard supportsNotifications else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
             Task { @MainActor [weak self] in
                 if let error {
@@ -449,19 +488,26 @@ final class MonitorModel: ObservableObject {
         return "offline há \(minutes) min · \(errorMessage)"
     }
 
-    private func evaluateNotifications() {
-        guard notificationsEnabled, let snapshot else { return }
-        let defaults = UserDefaults.standard
-        let cycleKey = "notifiedThresholds-\(snapshot.resetDateKey)"
-        var sent = Set(defaults.stringArray(forKey: cycleKey) ?? [])
-        if snapshot.entitlement > 0 {
-            let percent = snapshot.used / snapshot.entitlement * 100
-            for threshold in [50, 80, 90, 100] where percent >= Double(threshold) && !sent.contains("\(threshold)") {
-                notify(title: "Quota Copilot: \(threshold)%", body: "Você usou \(Self.number(snapshot.used)) de \(Self.number(snapshot.entitlement)) créditos.")
-                sent.insert("\(threshold)")
+    private func evaluateQuotaNotification(cycle: String, defaults: UserDefaults) {
+        let key = "notifiedThresholds-\(cycle)"
+        let sent = defaults.stringArray(forKey: key) ?? []
+        guard let alert = CycleQuotaAlert.reached(at: cyclePercent, after: sent.compactMap({ Int($0) }).max() ?? 0),
+              quotaNotificationsInFlight.insert(key).inserted else { return }
+
+        let title = quotaAlertTitle(alert)
+        let body = quotaAlertDetail
+        Task {
+            defer { quotaNotificationsInFlight.remove(key) }
+            if await scheduleNotification(title: title, body: body, sound: alert == .urgent || alert == .exhausted) {
+                defaults.set(sent + [String(alert.rawValue)], forKey: key)
             }
-            defaults.set(Array(sent), forKey: cycleKey)
         }
+    }
+
+    private func evaluateNotifications() {
+        guard supportsNotifications, notificationsEnabled, let snapshot else { return }
+        let defaults = UserDefaults.standard
+        evaluateQuotaNotification(cycle: snapshot.resetDateKey, defaults: defaults)
         // Só a projeção linear: o fallback do ciclo anterior não avisa no primeiro dia de um ciclo novo.
         if let metrics, metrics.projectionSource == .linear,
            let projected = metrics.projectedAtReset, projected > snapshot.entitlement {
@@ -496,7 +542,7 @@ final class MonitorModel: ObservableObject {
     /// Compara a leitura nova com a anterior (antes de `snapshot` ser sobrescrito): novo ciclo, mudança
     /// de créditos do plano e contador zerado antes do reset. Cada aviso uma vez por chave; nunca no demo.
     private func evaluateSnapshotChange(from previous: UsageSnapshot, to current: UsageSnapshot) {
-        guard notificationsEnabled, !isDemo else { return }
+        guard supportsNotifications, notificationsEnabled else { return }
         let defaults = UserDefaults.standard
         func once(_ key: String, title: String, body: String) {
             guard !defaults.bool(forKey: key) else { return }
@@ -529,18 +575,32 @@ final class MonitorModel: ObservableObject {
     }
 
     private func notify(title: String, body: String) {
+        Task { await scheduleNotification(title: title, body: body) }
+    }
+
+    @discardableResult
+    private func scheduleNotification(title: String, body: String, sound: Bool = false) async -> Bool {
+        guard supportsNotifications, notificationsEnabled else { return false }
         let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
-            guard settings.authorizationStatus == .authorized else { return }
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { [weak self] error in
-                guard let error else { return }
-                Task { @MainActor [weak self] in
-                    self?.notificationError = error.localizedDescription
-                }
+        let settings = await center.notificationSettings()
+        guard notificationsEnabled else { return false }
+        guard settings.authorizationStatus == .authorized else {
+            if settings.authorizationStatus == .denied {
+                notificationError = "Notificações desativadas nas configurações do macOS."
             }
+            return false
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        if sound { content.sound = .default }
+        do {
+            try await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+            notificationError = nil
+            return true
+        } catch {
+            notificationError = error.localizedDescription
+            return false
         }
     }
 
